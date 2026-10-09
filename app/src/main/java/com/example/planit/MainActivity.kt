@@ -1,9 +1,19 @@
 package com.example.planit
 
+import android.Manifest
+import android.app.AlarmManager
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -33,6 +43,7 @@ import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -51,16 +62,25 @@ import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.planit.data.local.entity.Activity
+import com.example.planit.data.local.entity.ScheduledBlock
+import com.example.planit.data.local.entity.relation.ScheduledBlockWithActivity
+import com.example.planit.notification.NotificationService
 import com.example.planit.ui.components.ActivityDock
 import com.example.planit.ui.components.HourHeight
+import com.example.planit.ui.components.MinuteScale
 import com.example.planit.ui.components.TimelineView
 import com.example.planit.ui.theme.CanvasBackground
 import com.example.planit.ui.theme.ClashDisplay
@@ -82,11 +102,15 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
 
         val app = application as PlanItApplication
+        val notificationService = NotificationService(app)
 
         setContent {
             PlanITTheme {
                 val viewModel: PlanItViewModel = viewModel(
-                    factory = PlanItViewModel.Factory(app.repository)
+                    factory = PlanItViewModel.Factory(
+                        repository = app.repository,
+                        notificationService = notificationService
+                    )
                 )
                 PlanItScreen(viewModel = viewModel)
             }
@@ -101,13 +125,68 @@ class MainActivity : ComponentActivity() {
  * - Vertically scrollable 24-hour timeline with #E0E0D4 dotted grid
  * - Dock-to-Timeline scheduling: Tapping an activity chip schedules it onto the timeline
  * - Movable and resizable blocks with 45-min short block threshold and pinned drag handle
+ * - Robust Android 13+ POST_NOTIFICATIONS and Android 14+ SCHEDULE_EXACT_ALARM handling
  */
 @Composable
 fun PlanItScreen(viewModel: PlanItViewModel) {
+    val context = LocalContext.current
     val activities by viewModel.activities.collectAsState()
     val selectedDate by viewModel.selectedDate.collectAsState()
     var showAddActivityDialog by remember { mutableStateOf(false) }
     var activityToEdit by remember { mutableStateOf<Activity?>(null) }
+
+    // Android 13+ POST_NOTIFICATIONS permission request
+    var hasNotificationPermission by remember {
+        mutableStateOf(
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                ContextCompat.checkSelfPermission(
+                    context,
+                    Manifest.permission.POST_NOTIFICATIONS
+                ) == PackageManager.PERMISSION_GRANTED
+            } else {
+                true
+            }
+        )
+    }
+
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        hasNotificationPermission = isGranted
+    }
+
+    LaunchedEffect(Unit) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !hasNotificationPermission) {
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
+    // Android 14+ / Android 12+ Exact Alarm Permission Check
+    var showExactAlarmDialog by remember { mutableStateOf(false) }
+
+    fun checkExactAlarmPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+            showExactAlarmDialog = !alarmManager.canScheduleExactAlarms()
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        checkExactAlarmPermission()
+    }
+
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                checkExactAlarmPermission()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
 
     // Robust Date Swiping using java.time.LocalDate
     val initialPage = 5000
@@ -124,6 +203,7 @@ fun PlanItScreen(viewModel: PlanItViewModel) {
     val density = LocalDensity.current
     val haptic = LocalHapticFeedback.current
     var lastSnappedCandidateMinutes by remember { mutableIntStateOf(-1) }
+    var optimisticBlocks by remember { mutableStateOf<List<ScheduledBlockWithActivity>>(emptyList()) }
 
     // Synchronize selectedDate when user swipes pages
     LaunchedEffect(pagerState.currentPage) {
@@ -133,15 +213,14 @@ fun PlanItScreen(viewModel: PlanItViewModel) {
         }
     }
 
-    // Candidate drop time calculation
+    // Candidate drop time calculation using 1.2.dp minute scale
     val candidateTime = if (draggingActivity != null &&
         dragPosition.x in timelineBoundsInRoot.left..timelineBoundsInRoot.right &&
         dragPosition.y in timelineBoundsInRoot.top..timelineBoundsInRoot.bottom
     ) {
-        val dropYInTimeline = dragPosition.y - timelineBoundsInRoot.top
-        val actualContentY = dropYInTimeline + timelineScrollState.value
-        val hourHeightPx = with(density) { HourHeight.toPx() }
-        val rawMinutes = (actualContentY / hourHeightPx) * 60f
+        val minuteScalePx = with(density) { MinuteScale.toPx() }
+        val localY = (dragPosition.y - timelineBoundsInRoot.top) + timelineScrollState.value
+        val rawMinutes = localY / minuteScalePx
         val duration = draggingActivity?.defaultDuration ?: 30
         val snappedMinutes = ((rawMinutes / 15.0).roundToInt() * 15).coerceIn(0, (1440 - duration).coerceAtLeast(0))
         LocalTime.of(snappedMinutes / 60, snappedMinutes % 60)
@@ -178,15 +257,47 @@ fun PlanItScreen(viewModel: PlanItViewModel) {
                     val pageDate = baseDate.plusDays((page - initialPage).toLong())
                     val pageBlocks by viewModel.getScheduledBlocksForDate(pageDate).collectAsState(initial = emptyList())
 
+                    // Merge persisted blocks from Room with any pending optimistic blocks for this pageDate
+                    val effectiveOptimistic = remember(optimisticBlocks, pageBlocks, pageDate) {
+                        optimisticBlocks.filter { opt ->
+                            opt.scheduledBlock.date == pageDate &&
+                            pageBlocks.none { real ->
+                                real.scheduledBlock.activityId == opt.scheduledBlock.activityId &&
+                                real.scheduledBlock.date == opt.scheduledBlock.date &&
+                                real.scheduledBlock.startTime == opt.scheduledBlock.startTime
+                            }
+                        }
+                    }
+                    val combinedBlocks = remember(pageBlocks, effectiveOptimistic) {
+                        pageBlocks + effectiveOptimistic
+                    }
+
+                    // Clean up persisted optimistic blocks once Room has emitted them
+                    LaunchedEffect(pageBlocks) {
+                        if (optimisticBlocks.isNotEmpty()) {
+                            optimisticBlocks = optimisticBlocks.filter { opt ->
+                                pageBlocks.none { real ->
+                                    real.scheduledBlock.activityId == opt.scheduledBlock.activityId &&
+                                    real.scheduledBlock.date == opt.scheduledBlock.date &&
+                                    real.scheduledBlock.startTime == opt.scheduledBlock.startTime
+                                }
+                            }
+                        }
+                    }
+
                     TimelineView(
-                        scheduledBlocks = pageBlocks,
+                        scheduledBlocks = combinedBlocks,
                         selectedDate = pageDate,
                         scrollState = timelineScrollState,
                         onUpdateBlock = { updatedBlock ->
                             viewModel.updateScheduledBlock(updatedBlock)
                         },
                         onDeleteBlock = { blockToDelete ->
-                            viewModel.deleteScheduledBlock(blockToDelete)
+                            if (blockToDelete.id < 0) {
+                                optimisticBlocks = optimisticBlocks.filter { it.scheduledBlock.id != blockToDelete.id }
+                            } else {
+                                viewModel.deleteScheduledBlock(blockToDelete)
+                            }
                         },
                         modifier = Modifier
                             .fillMaxSize()
@@ -195,7 +306,9 @@ fun PlanItScreen(viewModel: PlanItViewModel) {
                                     timelineBoundsInRoot = coordinates.boundsInRoot()
                                 }
                             },
-                        initialScrollHour = 8
+                        initialScrollHour = 8,
+                        draggingActivity = if (page == pagerState.currentPage) draggingActivity else null,
+                        dragPosition = dragPosition
                     )
                 }
 
@@ -212,21 +325,6 @@ fun PlanItScreen(viewModel: PlanItViewModel) {
                     },
                     onDragDelta = { delta ->
                         dragPosition += delta
-                        if (draggingActivity != null &&
-                            dragPosition.x in timelineBoundsInRoot.left..timelineBoundsInRoot.right &&
-                            dragPosition.y in timelineBoundsInRoot.top..timelineBoundsInRoot.bottom
-                        ) {
-                            val dropYInTimeline = dragPosition.y - timelineBoundsInRoot.top
-                            val actualContentY = dropYInTimeline + timelineScrollState.value
-                            val hourHeightPx = with(density) { HourHeight.toPx() }
-                            val rawMinutes = (actualContentY / hourHeightPx) * 60f
-                            val duration = draggingActivity?.defaultDuration ?: 30
-                            val snapped = ((rawMinutes / 15.0).roundToInt() * 15).coerceIn(0, (1440 - duration).coerceAtLeast(0))
-                            if (snapped != lastSnappedCandidateMinutes) {
-                                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                lastSnappedCandidateMinutes = snapped
-                            }
-                        }
                     },
                     onDragEnded = {
                         val activity = draggingActivity
@@ -234,10 +332,9 @@ fun PlanItScreen(viewModel: PlanItViewModel) {
                             dragPosition.x in timelineBoundsInRoot.left..timelineBoundsInRoot.right &&
                             dragPosition.y in timelineBoundsInRoot.top..timelineBoundsInRoot.bottom
                         ) {
-                            val dropYInTimeline = dragPosition.y - timelineBoundsInRoot.top
-                            val actualContentY = dropYInTimeline + timelineScrollState.value
-                            val hourHeightPx = with(density) { HourHeight.toPx() }
-                            val rawMinutes = (actualContentY / hourHeightPx) * 60f
+                            val minuteScalePx = with(density) { MinuteScale.toPx() }
+                            val localY = (dragPosition.y - timelineBoundsInRoot.top) + timelineScrollState.value
+                            val rawMinutes = localY / minuteScalePx
                             val duration = activity.defaultDuration
                             val snappedMinutes = ((rawMinutes / 15.0).roundToInt() * 15).coerceIn(0, (1440 - duration).coerceAtLeast(0))
                             val startTime = LocalTime.of(snappedMinutes / 60, snappedMinutes % 60)
@@ -252,12 +349,25 @@ fun PlanItScreen(viewModel: PlanItViewModel) {
                                 // Do not apply 15-minute rounding to the duration of Rigid blocks.
                                 startTime.plusMinutes(activity.defaultDuration.toLong())
                             }
-                            viewModel.scheduleBlock(
+
+                            // Optimistic State: immediately append temporary optimistic block to local UI state
+                            val tempId = -System.currentTimeMillis()
+                            val optimisticBlock = ScheduledBlock(
+                                id = tempId,
                                 activityId = activity.id,
                                 date = selectedDate,
                                 startTime = startTime,
                                 endTime = endTime
                             )
+                            val optimisticBlockWithActivity = ScheduledBlockWithActivity(
+                                scheduledBlock = optimisticBlock,
+                                activity = activity
+                            )
+                            optimisticBlocks = optimisticBlocks + optimisticBlockWithActivity
+
+                            // Persist to Room database & schedule notifications
+                            viewModel.insertScheduledBlock(optimisticBlock.copy(id = 0))
+
                             haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                         }
                         draggingActivity = null
@@ -300,6 +410,71 @@ fun PlanItScreen(viewModel: PlanItViewModel) {
                     onDelete = { actToDelete ->
                         viewModel.deleteActivity(actToDelete)
                         activityToEdit = null
+                    }
+                )
+            }
+
+            // Neo-Brutalist Exact Alarm Permission Dialog (Android 14+ / Android 12+)
+            if (showExactAlarmDialog) {
+                AlertDialog(
+                    onDismissRequest = { showExactAlarmDialog = false },
+                    containerColor = Color(0xFFFDFDF7),
+                    shape = RoundedCornerShape(16.dp),
+                    modifier = Modifier.border(BorderStroke(2.dp, Color.Black), RoundedCornerShape(16.dp)),
+                    title = {
+                        Text(
+                            text = "Enable Exact Alarms ⏰",
+                            fontFamily = ClashDisplay,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 18.sp,
+                            color = Color.Black
+                        )
+                    },
+                    text = {
+                        Text(
+                            text = "PlanIT needs permission to set exact alarms so notifications fire precisely when your scheduled activities begin.\n\nPlease enable 'Alarms & reminders' in system settings.",
+                            fontFamily = Satoshi,
+                            fontSize = 14.sp,
+                            color = Color.Black.copy(alpha = 0.8f)
+                        )
+                    },
+                    confirmButton = {
+                        Button(
+                            onClick = {
+                                showExactAlarmDialog = false
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                                    val intent = Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM).apply {
+                                        data = Uri.parse("package:${context.packageName}")
+                                    }
+                                    context.startActivity(intent)
+                                }
+                            },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = Color.Black,
+                                contentColor = Color.White
+                            ),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Text(
+                                text = "Open Settings",
+                                fontFamily = ClashDisplay,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.sp
+                            )
+                        }
+                    },
+                    dismissButton = {
+                        TextButton(
+                            onClick = { showExactAlarmDialog = false }
+                        ) {
+                            Text(
+                                text = "Later",
+                                fontFamily = Satoshi,
+                                fontWeight = FontWeight.Medium,
+                                color = Color.Black,
+                                fontSize = 13.sp
+                            )
+                        }
                     }
                 )
             }

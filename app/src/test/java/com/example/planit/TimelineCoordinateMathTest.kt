@@ -313,4 +313,154 @@ class TimelineCoordinateMathTest {
         val actualDuration = (endTime.hour * 60 + endTime.minute) - (startTime.hour * 60 + startTime.minute)
         assertEquals(20, actualDuration)
     }
+
+    @Test
+    fun dropToTimeline_exactLocalY_with1Point2DpScale() {
+        val density = 2.5f
+        val minuteScalePx = 1.2f * density // 3.0 px per minute
+        val rawScreenDropY = 850f
+        val timelineTopGlobal = 250f
+        val scrollOffset = 600f // scrolled 200 minutes in (600 / 3.0 = 200 min)
+
+        val localY = (rawScreenDropY - timelineTopGlobal) + scrollOffset // (850 - 250) + 600 = 1200 px
+        val rawMinutes = localY / minuteScalePx // 1200 / 3.0 = 400.0 minutes -> 6 hours 40 minutes (6:40 AM)
+        val duration = 30
+
+        val snappedMinutes = ((rawMinutes / 15.0).roundToInt() * 15).coerceIn(0, 1440 - duration)
+        assertEquals(405, snappedMinutes) // 400 min snapped to 15 min -> 405 min (6:45 AM)
+
+        val startTime = LocalTime.of(snappedMinutes / 60, snappedMinutes % 60)
+        assertEquals(LocalTime.of(6, 45), startTime)
+    }
+
+    @Test
+    fun optimisticState_rendersImmediatelyAndFiltersOutOncePersisted() {
+        val date = java.time.LocalDate.now()
+        val activity = com.example.planit.data.local.entity.Activity(
+            id = 1,
+            name = "Workout",
+            icon = "fitness",
+            color = 0xFFBAF2BB,
+            defaultDuration = 30,
+            isFlexible = true
+        )
+
+        val tempId = -System.currentTimeMillis()
+        val optimisticBlock = com.example.planit.data.local.entity.ScheduledBlock(
+            id = tempId,
+            activityId = activity.id,
+            date = date,
+            startTime = LocalTime.of(7, 0),
+            endTime = LocalTime.of(7, 30)
+        )
+        val optimisticWithAct = com.example.planit.data.local.entity.relation.ScheduledBlockWithActivity(
+            scheduledBlock = optimisticBlock,
+            activity = activity
+        )
+
+        var optimisticList = listOf(optimisticWithAct)
+        var realList = emptyList<com.example.planit.data.local.entity.relation.ScheduledBlockWithActivity>()
+
+        // 1. Before Room emits: combined blocks includes optimistic block
+        val effective1 = optimisticList.filter { opt ->
+            opt.scheduledBlock.date == date &&
+            realList.none { real ->
+                real.scheduledBlock.activityId == opt.scheduledBlock.activityId &&
+                real.scheduledBlock.date == opt.scheduledBlock.date &&
+                real.scheduledBlock.startTime == opt.scheduledBlock.startTime
+            }
+        }
+        val combined1 = realList + effective1
+        assertEquals(1, combined1.size)
+        assertEquals(tempId, combined1[0].scheduledBlock.id)
+
+        // 2. Room emits persisted block with positive ID
+        val persistedBlock = optimisticBlock.copy(id = 42)
+        realList = listOf(
+            com.example.planit.data.local.entity.relation.ScheduledBlockWithActivity(
+                scheduledBlock = persistedBlock,
+                activity = activity
+            )
+        )
+
+        // 3. After Room emits: effective optimistic filters out the temp block, no duplicates!
+        val effective2 = optimisticList.filter { opt ->
+            opt.scheduledBlock.date == date &&
+            realList.none { real ->
+                real.scheduledBlock.activityId == opt.scheduledBlock.activityId &&
+                real.scheduledBlock.date == opt.scheduledBlock.date &&
+                real.scheduledBlock.startTime == opt.scheduledBlock.startTime
+            }
+        }
+        val combined2 = realList + effective2
+        assertEquals(1, combined2.size)
+        assertEquals(42L, combined2[0].scheduledBlock.id)
+    }
+
+    @Test
+    fun dropPreviewGhost_previewTimeMath_continuousFingerTracking() {
+        val density = 3.0f
+        val minuteScalePx = 1.2f * density // 3.6 px/min
+        val timelineTop = 200f
+        val scrollStateValue = 720f // scrolled down 200 minutes (720 / 3.6)
+        val defaultDuration = 45
+
+        fun calculateGhostStartTime(fingerScreenY: Float): LocalTime {
+            val localY = (fingerScreenY - timelineTop) + scrollStateValue
+            val rawMinutes = localY / minuteScalePx
+            val snappedMinutes = ((rawMinutes / 15.0).roundToInt() * 15).coerceIn(0, 1440 - defaultDuration)
+            return LocalTime.of(snappedMinutes / 60, snappedMinutes % 60)
+        }
+
+        // Finger at Y = 200 (top of timeline): localY = 720 -> 200 min -> snapped to 195 or 210 min
+        // 200 / 15 = 13.33 -> round to 13 * 15 = 195 min (3:15 AM)
+        assertEquals(LocalTime.of(3, 15), calculateGhostStartTime(200f))
+
+        // Moving finger down continuously:
+        // Finger moves down by 54 px (15 minutes in px = 15 * 3.6 = 54 px)
+        // Y = 254 -> localY = 774 -> 215 min -> 215 / 15 = 14.33 -> 14 * 15 = 210 min (3:30 AM)
+        assertEquals(LocalTime.of(3, 30), calculateGhostStartTime(254f))
+
+        // Finger moves down by another 54 px -> 308 px -> 225 min (3:45 AM)
+        assertEquals(LocalTime.of(3, 45), calculateGhostStartTime(308f))
+    }
+
+    @Test
+    fun dropPreviewGhost_hapticTriggerLogic() {
+        var previousPreviewStartTime: LocalTime? = null
+        var hapticTriggerCount = 0
+
+        fun updatePreviewTime(newTime: LocalTime?) {
+            if (newTime != null && newTime != previousPreviewStartTime) {
+                hapticTriggerCount++
+                previousPreviewStartTime = newTime
+            } else if (newTime == null) {
+                previousPreviewStartTime = null
+            }
+        }
+
+        // 1. Initial appearance at 9:00 AM -> triggers 1st haptic
+        updatePreviewTime(LocalTime.of(9, 0))
+        assertEquals(1, hapticTriggerCount)
+
+        // 2. Continuous slight jitter within same 15-min slot -> NO extra haptics
+        updatePreviewTime(LocalTime.of(9, 0))
+        assertEquals(1, hapticTriggerCount)
+
+        // 3. User drags past 15-minute threshold to 9:15 AM -> triggers 2nd haptic!
+        updatePreviewTime(LocalTime.of(9, 15))
+        assertEquals(2, hapticTriggerCount)
+
+        // 4. User drags to 9:30 AM -> triggers 3rd haptic!
+        updatePreviewTime(LocalTime.of(9, 30))
+        assertEquals(3, hapticTriggerCount)
+
+        // 5. User moves finger off timeline -> resets previous, no haptic
+        updatePreviewTime(null)
+        assertEquals(3, hapticTriggerCount)
+
+        // 6. User re-enters at 9:30 AM -> triggers haptic again
+        updatePreviewTime(LocalTime.of(9, 30))
+        assertEquals(4, hapticTriggerCount)
+    }
 }

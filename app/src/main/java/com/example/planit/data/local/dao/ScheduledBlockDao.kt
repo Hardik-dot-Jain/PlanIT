@@ -47,8 +47,19 @@ interface ScheduledBlockDao {
     fun getAllScheduledBlocksWithActivity(): Flow<List<ScheduledBlockWithActivity>>
 
     @Transaction
+    @Query("SELECT * FROM scheduled_blocks ORDER BY date ASC, start_time ASC")
+    suspend fun getAllScheduledBlocksWithActivityOnce(): List<ScheduledBlockWithActivity>
+
+    @Transaction
     @Query("SELECT * FROM scheduled_blocks WHERE id = :id")
     fun getScheduledBlockWithActivityById(id: Long): Flow<ScheduledBlockWithActivity?>
+
+    @Transaction
+    @Query("SELECT * FROM scheduled_blocks WHERE id = :id")
+    suspend fun getScheduledBlockWithActivityByIdOnce(id: Long): ScheduledBlockWithActivity?
+
+    @Query("SELECT * FROM scheduled_blocks WHERE activity_id = :activityId ORDER BY date ASC, start_time ASC")
+    suspend fun getScheduledBlocksForActivityOnce(activityId: Long): List<ScheduledBlock>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insert(scheduledBlock: ScheduledBlock): Long

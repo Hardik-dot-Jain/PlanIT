@@ -28,6 +28,9 @@ class PlanItRepository(
     fun getActivityById(id: Long): Flow<Activity?> =
         activityDao.getActivityById(id)
 
+    suspend fun getActivityByIdOnce(id: Long): Activity? =
+        activityDao.getActivityByIdOnce(id)
+
     fun searchActivities(query: String): Flow<List<Activity>> =
         activityDao.searchActivities(query)
 
@@ -59,8 +62,17 @@ class PlanItRepository(
     val allScheduledBlocksWithActivity: Flow<List<ScheduledBlockWithActivity>> =
         scheduledBlockDao.getAllScheduledBlocksWithActivity()
 
+    suspend fun getAllScheduledBlocksWithActivityOnce(): List<ScheduledBlockWithActivity> =
+        scheduledBlockDao.getAllScheduledBlocksWithActivityOnce()
+
     fun getScheduledBlockById(id: Long): Flow<ScheduledBlock?> =
         scheduledBlockDao.getScheduledBlockById(id)
+
+    suspend fun getScheduledBlockWithActivityByIdOnce(id: Long): ScheduledBlockWithActivity? =
+        scheduledBlockDao.getScheduledBlockWithActivityByIdOnce(id)
+
+    suspend fun getScheduledBlocksForActivityOnce(activityId: Long): List<ScheduledBlock> =
+        scheduledBlockDao.getScheduledBlocksForActivityOnce(activityId)
 
     fun getScheduledBlocksForDate(date: LocalDate): Flow<List<ScheduledBlock>> =
         scheduledBlockDao.getScheduledBlocksForDate(date)

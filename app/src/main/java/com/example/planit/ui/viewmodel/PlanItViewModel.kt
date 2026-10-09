@@ -8,6 +8,7 @@ import com.example.planit.data.local.entity.ScheduledBlock
 import com.example.planit.data.local.entity.relation.ActivityWithScheduledBlocks
 import com.example.planit.data.local.entity.relation.ScheduledBlockWithActivity
 import com.example.planit.data.repository.PlanItRepository
+import com.example.planit.notification.NotificationService
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -19,6 +20,7 @@ import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import java.time.LocalDate
+import java.time.LocalDateTime
 import java.time.LocalTime
 import kotlin.math.roundToInt
 
@@ -31,7 +33,8 @@ import kotlin.math.roundToInt
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class PlanItViewModel(
-    private val repository: PlanItRepository
+    private val repository: PlanItRepository,
+    private val notificationService: NotificationService? = null
 ) : ViewModel() {
 
     // --- State: Activities ---
@@ -117,17 +120,42 @@ class PlanItViewModel(
 
     fun deleteActivity(activity: Activity) {
         viewModelScope.launch {
+            val blocks = repository.getScheduledBlocksForActivityOnce(activity.id)
+            blocks.forEach { notificationService?.cancelBlockAlarm(it.id) }
             repository.deleteActivity(activity)
         }
     }
 
     fun deleteActivityById(id: Long) {
         viewModelScope.launch {
+            val blocks = repository.getScheduledBlocksForActivityOnce(id)
+            blocks.forEach { notificationService?.cancelBlockAlarm(it.id) }
             repository.deleteActivityById(id)
         }
     }
 
     // --- Actions: Schedule Block Management ---
+
+    fun insertScheduledBlock(
+        block: ScheduledBlock,
+        onScheduled: ((Long) -> Unit)? = null
+    ) {
+        viewModelScope.launch {
+            val id = repository.insertScheduledBlock(block)
+            val savedBlock = block.copy(id = id)
+
+            // Auto-schedule exact alarm if block is in the future
+            val blockDateTime = LocalDateTime.of(block.date, block.startTime)
+            if (blockDateTime.isAfter(LocalDateTime.now())) {
+                val activity = repository.getActivityByIdOnce(block.activityId)
+                if (activity != null) {
+                    notificationService?.scheduleBlockAlarm(savedBlock, activity)
+                }
+            }
+
+            onScheduled?.invoke(id)
+        }
+    }
 
     fun scheduleBlock(
         activityId: Long,
@@ -136,32 +164,41 @@ class PlanItViewModel(
         endTime: LocalTime,
         onScheduled: ((Long) -> Unit)? = null
     ) {
-        viewModelScope.launch {
-            val block = ScheduledBlock(
-                activityId = activityId,
-                date = date,
-                startTime = startTime,
-                endTime = endTime
-            )
-            val id = repository.insertScheduledBlock(block)
-            onScheduled?.invoke(id)
-        }
+        val block = ScheduledBlock(
+            activityId = activityId,
+            date = date,
+            startTime = startTime,
+            endTime = endTime
+        )
+        insertScheduledBlock(block, onScheduled)
     }
 
     fun updateScheduledBlock(block: ScheduledBlock) {
         viewModelScope.launch {
             repository.updateScheduledBlock(block)
+            // Cancel existing alarm
+            notificationService?.cancelBlockAlarm(block.id)
+            // Re-schedule alarm if block time is in the future
+            val blockDateTime = LocalDateTime.of(block.date, block.startTime)
+            if (blockDateTime.isAfter(LocalDateTime.now())) {
+                val activity = repository.getActivityByIdOnce(block.activityId)
+                if (activity != null) {
+                    notificationService?.scheduleBlockAlarm(block, activity)
+                }
+            }
         }
     }
 
     fun deleteScheduledBlock(block: ScheduledBlock) {
         viewModelScope.launch {
+            notificationService?.cancelBlockAlarm(block.id)
             repository.deleteScheduledBlock(block)
         }
     }
 
     fun deleteScheduledBlockById(id: Long) {
         viewModelScope.launch {
+            notificationService?.cancelBlockAlarm(id)
             repository.deleteScheduledBlockById(id)
         }
     }
@@ -191,7 +228,14 @@ class PlanItViewModel(
                 startTime = startTime,
                 endTime = endTime
             )
-            repository.insertScheduledBlock(block)
+            val id = repository.insertScheduledBlock(block)
+            val savedBlock = block.copy(id = id)
+
+            // Auto-schedule exact alarm if block is in the future
+            val blockDateTime = LocalDateTime.of(targetDate, startTime)
+            if (blockDateTime.isAfter(LocalDateTime.now())) {
+                notificationService?.scheduleBlockAlarm(savedBlock, activity)
+            }
         }
     }
 
@@ -240,12 +284,13 @@ class PlanItViewModel(
     // --- Factory ---
 
     class Factory(
-        private val repository: PlanItRepository
+        private val repository: PlanItRepository,
+        private val notificationService: NotificationService? = null
     ) : ViewModelProvider.Factory {
         @Suppress("UNCHECKED_CAST")
         override fun <T : ViewModel> create(modelClass: Class<T>): T {
             if (modelClass.isAssignableFrom(PlanItViewModel::class.java)) {
-                return PlanItViewModel(repository) as T
+                return PlanItViewModel(repository, notificationService) as T
             }
             throw IllegalArgumentException("Unknown ViewModel class: ${modelClass.name}")
         }
