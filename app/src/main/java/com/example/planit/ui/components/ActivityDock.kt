@@ -1,11 +1,16 @@
 package com.example.planit.ui.components
 
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -30,6 +35,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInRoot
@@ -163,7 +169,7 @@ fun ActivityDock(
 
 /**
  * Individual Activity UI Chip rendered in Soft Neo-Brutalism aesthetic.
- * - Tap opens Edit Activity dialog.
+ * - Tap opens Edit Activity dialog with click squish animation (no grey ripple).
  * - Long-press & drag initiates global drag overlay to drop onto timeline.
  */
 @Composable
@@ -180,13 +186,32 @@ fun NeoBrutalistActivityChip(
     val cornerShape = RoundedCornerShape(16.dp)
     var positionInRoot by remember { mutableStateOf(Offset.Zero) }
 
+    val interactionSource = remember { MutableInteractionSource() }
+    val isPressed by interactionSource.collectIsPressedAsState()
+    val squishScale by animateFloatAsState(
+        targetValue = if (isPressed) 0.95f else 1.0f,
+        animationSpec = spring(
+            dampingRatio = Spring.DampingRatioMediumBouncy,
+            stiffness = Spring.StiffnessLow
+        ),
+        label = "chipSquishScale"
+    )
+
     Box(
         modifier = modifier
             .padding(end = 4.dp, bottom = 4.dp)
+            .graphicsLayer {
+                scaleX = squishScale
+                scaleY = squishScale
+            }
             .onGloballyPositioned { coordinates ->
                 positionInRoot = coordinates.positionInRoot()
             }
-            .clickable(onClick = onClick)
+            .clickable(
+                interactionSource = interactionSource,
+                indication = null,
+                onClick = onClick
+            )
             .pointerInput(activity.id) {
                 detectDragGesturesAfterLongPress(
                     onDragStart = { localOffset ->

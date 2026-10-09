@@ -1,5 +1,10 @@
 package com.example.planit.ui.components
 
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -26,16 +31,19 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
@@ -55,19 +63,19 @@ import com.example.planit.ui.theme.SoftPastelPalette
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
 import kotlin.math.roundToInt
+import kotlinx.coroutines.launch
 
 /**
  * ScheduledBlockItem composable for the timeline canvas.
  *
- * Requirements:
+ * Phase 3.8: The Butter Update:
+ * - Fluid Dragging: Visual offsetY tracks exact pixel movement without lag.
+ *   On release, it smoothly animates into the snapped position via spring physics.
+ * - Spring Physics: Drop shadow, border width, and scale animate with spring(dampingRatio = MediumBouncy, stiffness = Low).
+ *   On long-press lift: springs to scale 1.02f and shadow 8.dp.
+ * - Click Squish: Tapping squishes the block down to 0.95f, bouncing back on release.
  * - Deletion triggers via standard tap (simple click) on the card body.
- * - Long-press to drag: Moving the card requires holding the card body for a moment before dragging up/down.
- * - Visual Lift State: When dragging, drop shadow increases to 6.dp and border to 2.5.dp for a lifted effect.
- * - Resize Handle Isolation: Bottom resize handle allows immediate drag resize for flexible activities.
- * - If duration_in_minutes < 45: ONLY shows a horizontal Row with Activity Icon + Title (with Ellipsis).
- * - If duration_in_minutes >= 45: Shows full layout with Icon, Title, and time subtitle.
- * - Transient drag state for zero-lag 120fps movement.
- * - Snapped update on release, strictly preserving duration when moved.
+ * - Isolated bottom resize handle allows immediate resize dragging for flexible activities.
  */
 @Composable
 fun ScheduledBlockItem(
@@ -76,7 +84,8 @@ fun ScheduledBlockItem(
     timeColumnWidth: Dp,
     onUpdate: (ScheduledBlock) -> Unit,
     onDelete: (ScheduledBlock) -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    onDraggingChanged: (Boolean) -> Unit = {}
 ) {
     val block = blockWithActivity.scheduledBlock
     val activity = blockWithActivity.activity
@@ -95,9 +104,13 @@ fun ScheduledBlockItem(
         maxOf(36.dp, hourHeight * (originalDurationMinutes / 60f)).toPx()
     }
 
-    // 2. Transient local drag states for zero-lag movement
+    // 2. Transient local drag states & spring animatables for fluid movement
     var dragOffsetY by remember(block.id, initialYOffsetPx) { mutableFloatStateOf(initialYOffsetPx) }
+    val animOffsetY = remember(block.id) { Animatable(initialYOffsetPx) }
+    val coroutineScope = rememberCoroutineScope()
+
     var isDragging by remember { mutableStateOf(false) }
+    var isPressed by remember { mutableStateOf(false) }
 
     var currentHeightPx by remember(block.id, initialHeightPx) { mutableFloatStateOf(initialHeightPx) }
     var isResizing by remember { mutableStateOf(false) }
@@ -132,7 +145,55 @@ fun ScheduledBlockItem(
         (hourHeight * ((1440 - originalDurationMinutes.coerceAtLeast(15)) / 60f)).toPx()
     }
 
-    val shadowOffset = if (isDragging) 6.dp else 3.dp
+    // Spring physics states for shadow, border, and squish/lift scale
+    val shadowOffset by animateDpAsState(
+        targetValue = if (isDragging) 8.dp else 3.dp,
+        animationSpec = spring(
+            dampingRatio = Spring.DampingRatioMediumBouncy,
+            stiffness = Spring.StiffnessLow
+        ),
+        label = "shadowOffset"
+    )
+
+    val borderWidth by animateDpAsState(
+        targetValue = if (isDragging || isResizing) 2.5.dp else 2.dp,
+        animationSpec = spring(
+            dampingRatio = Spring.DampingRatioMediumBouncy,
+            stiffness = Spring.StiffnessLow
+        ),
+        label = "borderWidth"
+    )
+
+    val targetScale = when {
+        isDragging -> 1.02f
+        isPressed -> 0.95f
+        else -> 1.0f
+    }
+
+    val blockScale by animateFloatAsState(
+        targetValue = targetScale,
+        animationSpec = spring(
+            dampingRatio = Spring.DampingRatioMediumBouncy,
+            stiffness = Spring.StiffnessLow
+        ),
+        label = "blockScale"
+    )
+
+    // Sync external block changes smoothly when not dragging
+    LaunchedEffect(initialYOffsetPx) {
+        if (!isDragging && dragOffsetY != initialYOffsetPx) {
+            animOffsetY.snapTo(dragOffsetY)
+            animOffsetY.animateTo(
+                targetValue = initialYOffsetPx,
+                animationSpec = spring(
+                    dampingRatio = Spring.DampingRatioMediumBouncy,
+                    stiffness = Spring.StiffnessLow
+                )
+            ) {
+                dragOffsetY = value
+            }
+        }
+    }
 
     Box(
         modifier = modifier
@@ -141,8 +202,12 @@ fun ScheduledBlockItem(
             .offset { IntOffset(x = 0, y = dragOffsetY.roundToInt()) }
             .height(visualHeightDp)
             .padding(start = timeColumnWidth + 10.dp, end = 16.dp)
+            .graphicsLayer {
+                scaleX = blockScale
+                scaleY = blockScale
+            }
     ) {
-        // 1. Hard Drop Shadow (offset x = 3.dp, y = 3.dp; or x = 6.dp, y = 6.dp when lifted)
+        // 1. Hard Drop Shadow (springs between 3.dp and 8.dp on lift)
         Box(
             modifier = Modifier
                 .matchParentSize()
@@ -150,14 +215,14 @@ fun ScheduledBlockItem(
                 .background(Color.Black, shape = cardShape)
         )
 
-        // 2. Main Card Body: Long-press to drag; tap triggers delete confirmation
+        // 2. Main Card Body: Long-press to drag; tap triggers delete confirmation with click squish
         Box(
             modifier = Modifier
                 .matchParentSize()
                 .background(cardBgColor, shape = cardShape)
                 .border(
                     border = BorderStroke(
-                        width = if (isDragging || isResizing) 2.5.dp else 2.dp,
+                        width = borderWidth,
                         color = Color.Black
                     ),
                     shape = cardShape
@@ -165,6 +230,11 @@ fun ScheduledBlockItem(
                 .clip(cardShape)
                 .pointerInput(block.id) {
                     detectTapGestures(
+                        onPress = {
+                            isPressed = true
+                            tryAwaitRelease()
+                            isPressed = false
+                        },
                         onTap = {
                             if (!isDragging) {
                                 showDeleteConfirmationDialog = true
@@ -176,10 +246,12 @@ fun ScheduledBlockItem(
                     detectDragGesturesAfterLongPress(
                         onDragStart = {
                             isDragging = true
+                            onDraggingChanged(true)
                             haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                         },
                         onDrag = { change, dragAmount ->
                             change.consume()
+                            // Fluid dragging: visually tracks exact pixel movement
                             dragOffsetY = (dragOffsetY + dragAmount.y).coerceIn(0f, maxYPx)
                             val rawMinutes = (dragOffsetY / hourHeightPx) * 60f
                             val snappedStartMinutes = ((rawMinutes / 15.0).roundToInt() * 15)
@@ -191,6 +263,7 @@ fun ScheduledBlockItem(
                         },
                         onDragEnd = {
                             isDragging = false
+                            onDraggingChanged(false)
                             val rawMinutes = (dragOffsetY / hourHeightPx) * 60f
                             val snappedStartMinutes = ((rawMinutes / 15.0).roundToInt() * 15)
                                 .coerceIn(0, (1440 - originalDurationMinutes).coerceAtLeast(0))
@@ -202,8 +275,22 @@ fun ScheduledBlockItem(
                                 newStartTime.plusMinutes(activity.defaultDuration.toLong())
                             }
 
-                            dragOffsetY = with(density) {
+                            val targetSnappedY = with(density) {
                                 (hourHeight * (snappedStartMinutes / 60f)).toPx()
+                            }
+
+                            // Smoothly animate the block into its final 15-minute snapped position
+                            coroutineScope.launch {
+                                animOffsetY.snapTo(dragOffsetY)
+                                animOffsetY.animateTo(
+                                    targetValue = targetSnappedY,
+                                    animationSpec = spring(
+                                        dampingRatio = Spring.DampingRatioMediumBouncy,
+                                        stiffness = Spring.StiffnessLow
+                                    )
+                                ) {
+                                    dragOffsetY = value
+                                }
                             }
 
                             onUpdate(
@@ -215,7 +302,19 @@ fun ScheduledBlockItem(
                         },
                         onDragCancel = {
                             isDragging = false
-                            dragOffsetY = initialYOffsetPx
+                            onDraggingChanged(false)
+                            coroutineScope.launch {
+                                animOffsetY.snapTo(dragOffsetY)
+                                animOffsetY.animateTo(
+                                    targetValue = initialYOffsetPx,
+                                    animationSpec = spring(
+                                        dampingRatio = Spring.DampingRatioMediumBouncy,
+                                        stiffness = Spring.StiffnessLow
+                                    )
+                                ) {
+                                    dragOffsetY = value
+                                }
+                            }
                         }
                     )
                 }

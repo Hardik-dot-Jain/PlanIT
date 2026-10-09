@@ -1,5 +1,10 @@
 package com.example.planit.ui.components
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
@@ -16,8 +21,11 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import java.time.LocalDate
 import java.time.LocalTime
 import androidx.compose.ui.Alignment
@@ -31,12 +39,14 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.zIndex
 import com.example.planit.data.local.entity.ScheduledBlock
 import com.example.planit.data.local.entity.relation.ScheduledBlockWithActivity
 import com.example.planit.ui.theme.CanvasBackground
 import com.example.planit.ui.theme.DottedGridColor
 import com.example.planit.ui.theme.Satoshi
 import com.example.planit.ui.theme.TimeMarkerText
+import kotlinx.coroutines.delay
 
 // Hardcoded vertical scale: 1 hour = 72.dp
 val HourHeight: Dp = 72.dp
@@ -98,15 +108,46 @@ fun TimelineView(
             )
 
             // 3. Interactive Scheduled Blocks on the Timeline
+            var draggingBlockId by remember { mutableStateOf<Long?>(null) }
+
             scheduledBlocks.forEach { blockWithActivity ->
-                key(blockWithActivity.scheduledBlock.id) {
-                    ScheduledBlockItem(
-                        blockWithActivity = blockWithActivity,
-                        hourHeight = HourHeight,
-                        timeColumnWidth = TimeColumnWidth,
-                        onUpdate = onUpdateBlock,
-                        onDelete = onDeleteBlock
-                    )
+                val blockId = blockWithActivity.scheduledBlock.id
+                key(blockId) {
+                    var isVisible by remember { mutableStateOf(false) }
+                    var isDeleted by remember { mutableStateOf(false) }
+
+                    LaunchedEffect(Unit) {
+                        isVisible = true
+                    }
+
+                    val isThisBlockDragging = draggingBlockId == blockId
+
+                    AnimatedVisibility(
+                        visible = isVisible && !isDeleted,
+                        enter = fadeIn() + scaleIn(initialScale = 0.8f),
+                        exit = fadeOut() + scaleOut(targetScale = 0.8f),
+                        modifier = Modifier.zIndex(if (isThisBlockDragging) 10f else 1f)
+                    ) {
+                        ScheduledBlockItem(
+                            blockWithActivity = blockWithActivity,
+                            hourHeight = HourHeight,
+                            timeColumnWidth = TimeColumnWidth,
+                            onUpdate = onUpdateBlock,
+                            onDelete = {
+                                isDeleted = true
+                            },
+                            onDraggingChanged = { dragging ->
+                                draggingBlockId = if (dragging) blockId else null
+                            }
+                        )
+                    }
+
+                    LaunchedEffect(isDeleted) {
+                        if (isDeleted) {
+                            delay(300)
+                            onDeleteBlock(blockWithActivity.scheduledBlock)
+                        }
+                    }
                 }
             }
 
