@@ -1,7 +1,7 @@
 # PlanIT
 *A minimalist, offline-first visual daily planner with fluid physics and a soft neo-brutalist aesthetic.*
 
-I needed a zero-clutter, highly tactile way to time-block my day without getting distracted by a bloated UI. I couldn't find a planner that fit the aesthetic and fluid drag-and-drop feel I wanted, so I architected and shipped this offline-first Android application in a rapid 12-hour sprint.
+I needed a zero-clutter, highly tactile way to time-block my day without getting distracted by a bloated UI. I couldn't find a planner that fit the aesthetic and fluid drag-and-drop feel I wanted, so I made this offline-first Android application in a 12-hour sprint.
 
 ## 🚀 Key Features
 
